@@ -1,0 +1,7 @@
+﻿copernicusmarine
+xarray
+netcdf4
+h5netcdf
+numpy
+matplotlib
+cartopy

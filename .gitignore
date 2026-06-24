@@ -1,0 +1,24 @@
+﻿# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Generated files
+tmp/
+public/
+data/
+*.nc
+*.grib
+*.grib2
+*.h5
+*.zarr/
+
+# Secrets
+.env
+.cdsapirc
+.copernicusmarine/
+.copernicusmarine-credentials
+
+# OS / editor
+Thumbs.db
+.DS_Store
