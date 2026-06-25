@@ -1,5 +1,6 @@
 ﻿from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from urllib.request import urlopen
 import json
 
 import numpy as np
@@ -188,10 +189,40 @@ lats = sst_light["latitude"].values
 times = sst_light["time"].values
 z_all = sst_light.values
 
-# 念のため、配列の型を軽くする
+# 配列の型を軽くする
 z_all = z_all.astype("float32")
 
-time_labels = [str(t)[:19].replace("T", " ") for t in times]
+# ============================================================
+# Time labels in JST
+# ============================================================
+
+JST = timezone(timedelta(hours=9))
+
+
+def numpy_datetime64_to_datetime_utc(t):
+    """
+    numpy.datetime64 を Python datetime UTC に変換する。
+    """
+    seconds = t.astype("datetime64[s]").astype("int64")
+    return datetime.fromtimestamp(int(seconds), tz=timezone.utc)
+
+
+time_dt_utc = [numpy_datetime64_to_datetime_utc(t) for t in times]
+time_dt_jst = [t.astimezone(JST) for t in time_dt_utc]
+
+# 年はスライダーに毎回出さず、タイトルや説明欄で1回だけ表示する
+years_jst = sorted({t.year for t in time_dt_jst})
+if len(years_jst) == 1:
+    year_label_jst = str(years_jst[0])
+else:
+    year_label_jst = f"{years_jst[0]}–{years_jst[-1]}"
+
+# スライダーに表示する短い時刻ラベル
+# 例：06/26 09:00
+time_labels = [t.strftime("%m/%d %H:%M") for t in time_dt_jst]
+
+# metadata用にはJSTで少し詳しく残す
+time_labels_jst_full = [t.strftime("%Y-%m-%d %H:%M JST") for t in time_dt_jst]
 
 # 全時刻で色スケールを固定
 zmin = float(np.nanpercentile(z_all, 2))
@@ -204,46 +235,176 @@ print(f"Color range: {zmin:.2f} to {zmax:.2f}")
 
 
 # ============================================================
+# Land polygons from Natural Earth
+# ============================================================
+
+print("Preparing land polygons...")
+
+LAND_GEOJSON_URL = (
+    "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/"
+    "master/geojson/ne_10m_land.geojson"
+)
+
+
+def ring_intersects_domain(ring, lon_min, lon_max, lat_min, lat_max):
+    """
+    GeoJSONの1つのringが表示領域と交差するか簡易判定する。
+    """
+    xs = [p[0] for p in ring]
+    ys = [p[1] for p in ring]
+
+    if max(xs) < lon_min:
+        return False
+    if min(xs) > lon_max:
+        return False
+    if max(ys) < lat_min:
+        return False
+    if min(ys) > lat_max:
+        return False
+
+    return True
+
+
+def make_land_traces():
+    """
+    Natural Earthの陸域GeoJSONを取得し、
+    PlotlyのScatter traceとして返す。
+
+    ここではcartopy/geopandasを使わず、
+    GitHub Actionsで軽く動くように標準ライブラリでGeoJSONを読む。
+    """
+    land_traces = []
+
+    try:
+        with urlopen(LAND_GEOJSON_URL, timeout=60) as response:
+            land_geojson = json.load(response)
+
+        for feature in land_geojson["features"]:
+            geom = feature["geometry"]
+            geom_type = geom["type"]
+            coords = geom["coordinates"]
+
+            if geom_type == "Polygon":
+                polygons = [coords]
+            elif geom_type == "MultiPolygon":
+                polygons = coords
+            else:
+                continue
+
+            for polygon in polygons:
+                # polygon[0] は外側の境界線。
+                # 穴はここでは省略する。
+                outer_ring = polygon[0]
+
+                if not ring_intersects_domain(
+                    outer_ring, LON_MIN, LON_MAX, LAT_MIN, LAT_MAX
+                ):
+                    continue
+
+                x = [p[0] for p in outer_ring]
+                y = [p[1] for p in outer_ring]
+
+                land_traces.append(
+                    go.Scatter(
+                        x=x,
+                        y=y,
+                        mode="lines",
+                        fill="toself",
+                        fillcolor="rgba(238, 232, 218, 0.95)",
+                        line=dict(color="rgba(80, 80, 80, 0.9)", width=0.8),
+                        hoverinfo="skip",
+                        showlegend=False,
+                        name="Land",
+                    )
+                )
+
+        print(f"Land polygon traces: {len(land_traces)}")
+
+    except Exception as e:
+        # 陸域GeoJSON取得に失敗しても、SSTページ自体は作成する
+        print(f"Warning: failed to load land polygons: {e}")
+        land_traces = []
+
+    return land_traces
+
+
+land_traces = make_land_traces()
+
+
+# ============================================================
+# Helper traces
+# ============================================================
+
+def make_heatmap_trace(z):
+    """
+    SST塗りつぶし用Heatmap。
+    """
+    return go.Heatmap(
+        z=z,
+        x=lons,
+        y=lats,
+        zmin=zmin,
+        zmax=zmax,
+        colorscale="Turbo",
+        colorbar=dict(title="thetao (°C)"),
+        hovertemplate=(
+            "Lon: %{x:.2f}<br>"
+            "Lat: %{y:.2f}<br>"
+            "SST: %{z:.2f} °C<extra></extra>"
+        ),
+        name="SST",
+    )
+
+
+def make_18c_contour_trace(z):
+    """
+    18℃だけの等温線。
+    """
+    return go.Contour(
+        z=z,
+        x=lons,
+        y=lats,
+        contours=dict(
+            start=18,
+            end=18,
+            size=1,
+            coloring="lines",
+            showlabels=True,
+            labelfont=dict(size=11, color="black"),
+        ),
+        line=dict(color="black", width=2),
+        showscale=False,
+        hoverinfo="skip",
+        name="18°C isotherm",
+        connectgaps=False,
+    )
+
+
+# ============================================================
 # Create Plotly figure
 # ============================================================
 
+# traceの順番：
+# 0: SST heatmap
+# 1: 18℃等温線
+# 2以降: 陸域ポリゴン
+#
+# frameでは0番と1番だけを更新し、陸域は固定背景として残す。
 fig = go.Figure(
     data=[
-        go.Heatmap(
-            z=z_all[0],
-            x=lons,
-            y=lats,
-            zmin=zmin,
-            zmax=zmax,
-            colorscale="Turbo",
-            colorbar=dict(title="thetao (°C)"),
-            hovertemplate=(
-                "Lon: %{x:.2f}<br>"
-                "Lat: %{y:.2f}<br>"
-                "SST: %{z:.2f} °C<extra></extra>"
-            ),
-        )
+        make_heatmap_trace(z_all[0]),
+        make_18c_contour_trace(z_all[0]),
+        *land_traces,
     ]
 )
 
 fig.frames = [
     go.Frame(
         data=[
-            go.Heatmap(
-                z=z_all[i],
-                x=lons,
-                y=lats,
-                zmin=zmin,
-                zmax=zmax,
-                colorscale="Turbo",
-                colorbar=dict(title="thetao (°C)"),
-                hovertemplate=(
-                    "Lon: %{x:.2f}<br>"
-                    "Lat: %{y:.2f}<br>"
-                    "SST: %{z:.2f} °C<extra></extra>"
-                ),
-            )
+            make_heatmap_trace(z_all[i]),
+            make_18c_contour_trace(z_all[i]),
         ],
+        traces=[0, 1],
         name=time_labels[i],
     )
     for i in range(len(time_labels))
@@ -267,20 +428,32 @@ slider_steps = [
 
 fig.update_layout(
     title=(
-        f"Northwest Pacific SST Forecast<br>"
+        f"Northwest Pacific SST Forecast ({year_label_jst} JST)<br>"
         f"{VARIABLE} at {selected_depth:.3f} m, "
         f"{LAT_MIN}–{LAT_MAX}°N, {LON_MIN}–{LON_MAX}°E"
     ),
     xaxis_title="Longitude",
     yaxis_title="Latitude",
     width=1050,
-    height=700,
-    margin=dict(l=60, r=40, t=90, b=130),
+    height=720,
+    margin=dict(l=60, r=40, t=95, b=145),
+    xaxis=dict(
+        range=[LON_MIN, LON_MAX],
+        constrain="domain",
+    ),
+    yaxis=dict(
+        range=[LAT_MIN, LAT_MAX],
+        scaleanchor="x",
+        scaleratio=1,
+    ),
     sliders=[
         {
             "active": 0,
-            "currentvalue": {"prefix": "Time: "},
-            "pad": {"t": 45},
+            "currentvalue": {
+                "prefix": f"Time ({year_label_jst} JST): ",
+                "font": {"size": 14},
+            },
+            "pad": {"t": 50},
             "steps": slider_steps,
         }
     ],
@@ -289,7 +462,7 @@ fig.update_layout(
             "type": "buttons",
             "direction": "left",
             "x": 0.05,
-            "y": -0.12,
+            "y": -0.13,
             "buttons": [
                 {
                     "label": "Play",
@@ -333,6 +506,7 @@ plot_html = pio.to_html(
 
 metadata = {
     "generated_at_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+    "generated_at_jst": now_utc.astimezone(JST).strftime("%Y-%m-%d %H:%M:%S JST"),
     "product_id": PRODUCT_ID,
     "product_name": "Global Ocean Physics Analysis and Forecast",
     "dataset_id": DATASET_ID,
@@ -348,9 +522,10 @@ metadata = {
     "target_depth_m": TARGET_DEPTH,
     "selected_depth_m": selected_depth,
     "forecast_days": FORECAST_DAYS,
-    "start_datetime": f"{used_start_date}T00:00:00",
-    "end_datetime": f"{used_end_date}T00:00:00",
-    "time_steps": time_labels,
+    "start_datetime_utc": f"{used_start_date}T00:00:00",
+    "end_datetime_utc": f"{used_end_date}T00:00:00",
+    "time_steps_jst": time_labels_jst_full,
+    "time_year_label_jst": year_label_jst,
     "number_of_time_steps": len(time_labels),
     "original_grid_degree": 0.083,
     "spatial_stride": SPATIAL_STRIDE,
@@ -359,11 +534,14 @@ metadata = {
     "latitude_points_after_thinning": int(len(lats)),
     "color_scale_min": zmin,
     "color_scale_max": zmax,
+    "contour_levels_celsius": [18],
+    "land_polygon_source": LAND_GEOJSON_URL,
     "netcdf_file": LIGHT_NC.name,
     "html_file": HTML_FILE.name,
     "note": (
         "Latitude and longitude are thinned by keeping every 4th grid point. "
-        "The original 0.083 degree grid becomes approximately 0.33 degree."
+        "The original 0.083 degree grid becomes approximately 0.33 degree. "
+        "Time labels are shown in JST. The 18°C isotherm is drawn as a black contour."
     ),
 }
 
@@ -426,8 +604,10 @@ html = f"""<!DOCTYPE html>
       <li>Region: {LAT_MIN}–{LAT_MAX}°N, {LON_MIN}–{LON_MAX}°E</li>
       <li>Selected depth: {selected_depth:.3f} m</li>
       <li>Time range: {used_start_date} to {used_end_date} UTC</li>
+      <li>Display time zone: JST</li>
       <li>Grid thinning: keep every {SPATIAL_STRIDE}th point</li>
-      <li>Generated at: {now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")}</li>
+      <li>18°C isotherm: black contour</li>
+      <li>Generated at: {now_utc.astimezone(JST).strftime("%Y-%m-%d %H:%M:%S JST")}</li>
     </ul>
     <p>
       <a href="latest_sst_light.nc">Download lightweight NetCDF</a>
@@ -436,9 +616,10 @@ html = f"""<!DOCTYPE html>
     </p>
   </div>
 
-  <h2>Interactive SST animation</h2>
+  <h2>Interactive SST animation ({year_label_jst} JST)</h2>
   <p>
     Use the slider or Play/Pause buttons to view changes through time.
+    Time labels are shown in JST. The black line indicates the 18°C isotherm.
   </p>
 
   {plot_html}
@@ -450,28 +631,3 @@ html = f"""<!DOCTYPE html>
 HTML_FILE.write_text(html, encoding="utf-8")
 
 print(f"Saved HTML: {HTML_FILE}")
-
-
-# ============================================================
-# Final check
-# ============================================================
-
-print("Generated files in public/:")
-for path in sorted(PUBLIC_DIR.iterdir()):
-    print(f" - {path.name} ({path.stat().st_size / 1024:.1f} KiB)")
-
-
-# ============================================================
-# Cleanup
-# ============================================================
-
-if RAW_NC.exists():
-    RAW_NC.unlink()
-    print(f"Removed temporary file: {RAW_NC}")
-
-try:
-    TMP_DIR.rmdir()
-except OSError:
-    pass
-
-print("Completed successfully.")
